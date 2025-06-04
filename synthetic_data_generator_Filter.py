@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tqdm.auto import tqdm
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datasets import Dataset as HFDataset, concatenate_datasets, load_dataset
 from sentence_transformers import SentenceTransformer
 from transformers import (
@@ -25,7 +25,7 @@ class SyntheticDataGeneratorAndFilter:
     def __init__(self,
                  teacher_model_name_or_path: str,
                  teacher_tokenizer_name_or_path: str,  # Can be same as model
-                 sbert_model_name: str,
+                 sbert_model_instance: Optional[SentenceTransformer] = None,
                  src_lang_nllb_code: str,  # e.g., "luo_Latn"
                  tgt_lang_nllb_code: str,  # e.g., "swa_Latn"
                  device: str = DEVICE):
@@ -55,7 +55,7 @@ class SyntheticDataGeneratorAndFilter:
         )
         logger.info("Teacher model and tokenizer loaded.")
 
-        self.sbert = SentenceTransformer(sbert_model_name, device=self.device)
+        self.sbert = sbert_model_instance
         logger.info("SBERT model loaded.")
         self.chrf_metric = evaluate.load('chrf')
 

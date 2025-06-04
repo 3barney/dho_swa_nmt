@@ -1,6 +1,6 @@
 import logging
 from collections import Counter
-from typing import List, Dict
+from typing import List, Dict, Optional
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
 
@@ -75,6 +75,93 @@ class CharacterVocabulary:
         else:
             char_ids.extend([self.pad_id] * (max_char_len - len(char_ids)))
         return char_ids
+
+    def build_from_data(self,
+                        all_sentences_for_vocab: List[str],
+                        subword_tokenizer: AutoTokenizer,
+                        task_prefixes: Optional[List[str]] = None):
+        """
+        Builds or extends the character vocabulary from various data sources.
+
+        This method collects all unique characters from:
+        1. The vocabulary of the provided `subword_tokenizer`.
+        2. All special tokens defined in the `subword_tokenizer`.
+        3. Optional `task_prefixes`.
+        4. All `all_sentences_for_vocab` after they are tokenized into subwords.
+
+        Characters already present in the vocabulary (e.g., initial special tokens)
+        are not added again.
+
+        Args:
+            all_sentences_for_vocab (List[str]): A list of sentences (strings) to
+                                                 extract characters from.
+            subword_tokenizer (AutoTokenizer): A Hugging Face tokenizer instance used
+                                               to process sentences into subwords and
+                                               to source characters from its vocabulary.
+            task_prefixes (Optional[List[str]]): An optional list of task-specific prefix
+                                                 strings to also include characters from.
+        """
+        logger.info("Starting to build character vocabulary from data...")
+        char_counts = Counter()
+
+        # 1. Add characters from the subword tokenizer's own vocabulary
+        if hasattr(subword_tokenizer, 'get_vocab') and callable(subword_tokenizer.get_vocab):
+            logger.info("Processing characters from subword tokenizer's vocabulary...")
+            subword_vocab_dict = subword_tokenizer.get_vocab()
+            for subword_token_str in tqdm(subword_vocab_dict.keys(), desc="Subword Vocab Chars"):
+                char_counts.update(subword_token_str)
+        else:
+            logger.warning("Subword tokenizer does not have a callable `get_vocab` method. "
+                           "Characters from its vocabulary won't be explicitly added. "
+                           "Relying on its special tokens and provided sentences.")
+
+        # 2. Add characters from the subword tokenizer's special tokens
+        logger.info("Processing characters from subword tokenizer's special tokens...")
+        if hasattr(subword_tokenizer, 'all_special_tokens') and subword_tokenizer.all_special_tokens:
+            for special_token in tqdm(subword_tokenizer.all_special_tokens, desc="Subword Special Tokens Chars"):
+                char_counts.update(special_token)
+        else:
+            logger.warning("Subword tokenizer does not have `all_special_tokens` or it's empty.")
+
+        # 3. Add characters from task prefixes, if provided
+        if task_prefixes:
+            logger.info("Processing characters from task prefixes...")
+            for prefix in tqdm(task_prefixes, desc="Task Prefix Chars"):
+                char_counts.update(prefix)
+
+        # 4. Process characters from the provided sentences
+        logger.info("Processing characters from provided sentences...")
+        for sentence in tqdm(all_sentences_for_vocab, desc="Sentence Chars"):
+            if not sentence:  # Skip empty sentences
+                continue
+            # Tokenize the sentence into subword strings
+            subword_strings = subword_tokenizer.tokenize(sentence)
+            for subword_str in subword_strings:
+                char_counts.update(subword_str)
+
+        # Add new characters to the vocabulary
+        logger.info("Adding new characters to the vocabulary...")
+        added_chars_count = 0
+        for char, count in tqdm(char_counts.most_common(), desc="Finalizing Char Vocab"):
+            if char not in self.char2id:  # Add only if new
+                new_id = len(self.char2id)
+                self.char2id[char] = new_id
+                self.id2char[new_id] = char
+                added_chars_count += 1
+
+        logger.info(f"Added {added_chars_count} new unique characters to the vocabulary.")
+        logger.info(f"Total character vocabulary size: {len(self.char2id)} unique characters.")
+
+        # Verification: Ensure special char tokens are still correctly mapped (they should be)
+        for token_name, token_val in [("CHAR_PAD_TOKEN", CHAR_PAD_TOKEN),
+                                      ("CHAR_UNK_TOKEN", CHAR_UNK_TOKEN),
+                                      ("CHAR_SOW_TOKEN", CHAR_SOW_TOKEN),
+                                      ("CHAR_EOW_TOKEN", CHAR_EOW_TOKEN)]:
+            if token_val not in self.char2id:
+                logger.error(
+                    f"CRITICAL ERROR: Special token {token_name} ('{token_val}') is missing from char2id after build_from_data.")
+            elif self.id2char.get(self.char2id[token_val]) != token_val:
+                logger.error(f"CRITICAL ERROR: Special token {token_name} ('{token_val}') has inconsistent mapping.")
 
     def __len__(self):
         return len(self.char2id)

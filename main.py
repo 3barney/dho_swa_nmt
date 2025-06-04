@@ -9,6 +9,7 @@ import evaluate
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+from peft import PeftModel
 from tqdm.auto import tqdm
 from datasets import Dataset as HFDataset, concatenate_datasets, load_dataset
 from transformers import (
@@ -19,7 +20,7 @@ from transformers import (
     # DataCollatorForSeq2Seq, # We will use our custom collate_fn
     pipeline,
     BitsAndBytesConfig,
-    EarlyStoppingCallback
+    EarlyStoppingCallback, GenerationConfig
 )
 from sentence_transformers import SentenceTransformer
 
@@ -51,52 +52,13 @@ TGT_LANG_NLLB = "swh_Latn"
 SRC_LANG_SHORT = "luo"
 TGT_LANG_SHORT = "swh"
 
-# DATA_DIRECTORY = Path("data/parallel")  # Main directory for user's data
-# DATA_DIRECTORY.mkdir(parents=True, exist_ok=True)
-#
-# # User-provided Monolingual data paths
-# USER_MONO_SRC_DIR = DATA_DIRECTORY / "mono_luo"  # Expect .txt files inside
-# USER_MONO_TGT_DIR = DATA_DIRECTORY / "mono_swa"  # Expect .txt files inside
-#
-# # User-provided Parallel data paths (Moses format: one file for source, one for target)
-# USER_PARALLEL_TRAIN_SRC_FILE = DATA_DIRECTORY / f"train.{SRC_LANG_SHORT}"
-# USER_PARALLEL_TRAIN_TGT_FILE = DATA_DIRECTORY / f"train.{TGT_LANG_SHORT}"
-# USER_PARALLEL_DEV_SRC_FILE = DATA_DIRECTORY / f"dev.{SRC_LANG_SHORT}"  # Optional, but highly recommended
-# USER_PARALLEL_DEV_TGT_FILE = DATA_DIRECTORY / f"dev.{TGT_LANG_SHORT}"  # Optional
-
-# BASE_PROJECT_DIR = Path(".")
 BASE_PROJECT_DIR = Path("/content")
 DATA_ROOT_DIR = BASE_PROJECT_DIR / "data"
-
 USER_MONO_SRC_DIR = DATA_ROOT_DIR / "monolingual" / "collected"
-# Your 'processed' folder for Swahili monolingual data (currently empty, but path defined)
-USER_MONO_TGT_DIR = DATA_ROOT_DIR / "monolingual" / "processed" # Or "mono_swa" if you create it
+USER_MONO_TGT_DIR = DATA_ROOT_DIR / "monolingual" / "processed"
 
-# Parallel data path
-# Your parallel data is a single CSV file in 'data/parallel/'
-# The script was expecting separate .luo and .swa files (Moses format).
-# You will need to adjust the `FileProcessor.load_and_process_parallel_files` method
-# or pre-process your CSV into two separate files (one for Dholuo, one for Swahili).
+PARALLEL_CSV_FILE = DATA_ROOT_DIR / "parallel" / "dholuo_swahili.csv"
 
-# For now, let's define the path to your CSV.
-# You'll need to specify the CSV filename. Let's assume it's 'dholuo_swahili_parallel.csv'
-PARALLEL_CSV_FILE = DATA_ROOT_DIR / "parallel" / "dholuo_swahili_parallel.csv"
-
-# The script's existing structure for parallel files is (Moses format):
-# USER_PARALLEL_TRAIN_SRC_FILE = DATA_ROOT_DIR / "parallel" / f"train.{SRC_LANG_SHORT}"
-# USER_PARALLEL_TRAIN_TGT_FILE = DATA_ROOT_DIR / "parallel" / f"train.{TGT_LANG_SHORT}"
-# USER_PARALLEL_DEV_SRC_FILE = DATA_ROOT_DIR / "parallel" / f"dev.{SRC_LANG_SHORT}"
-# USER_PARALLEL_DEV_TGT_FILE = DATA_ROOT_DIR / "parallel" / f"dev.{TGT_LANG_SHORT}"
-
-# You have two main options for the parallel data:
-# Option A: Preprocess your CSV into the two separate files expected by the script.
-#           (e.g., train.luo and train.swa) and place them in DATA_ROOT_DIR / "parallel"
-# Option B: Modify the `FileProcessor.load_and_process_parallel_files` method in your script
-#           to read directly from the CSV.
-
-# Let's assume for now you will pre-process your CSV into two files named:
-# 'train_parallel.luo' and 'train_parallel.swa' and place them in 'data/parallel/'
-# If you have a separate dev split from the CSV, name them 'dev_parallel.luo' and 'dev_parallel.swa'
 
 USER_PARALLEL_TRAIN_SRC_FILE = DATA_ROOT_DIR / "parallel" / f"train_parallel.{SRC_LANG_SHORT}"
 USER_PARALLEL_TRAIN_TGT_FILE = DATA_ROOT_DIR / "parallel" / f"train_parallel.{TGT_LANG_SHORT}"
@@ -105,34 +67,26 @@ USER_PARALLEL_DEV_SRC_FILE = DATA_ROOT_DIR / "parallel" / f"dev_parallel.{SRC_LA
 USER_PARALLEL_DEV_TGT_FILE = DATA_ROOT_DIR / "parallel" / f"dev_parallel.{TGT_LANG_SHORT}"
 
 
-# Ensure directories exist (optional, as the script might do this later, but good for clarity)
 USER_MONO_SRC_DIR.mkdir(parents=True, exist_ok=True)
-USER_MONO_TGT_DIR.mkdir(parents=True, exist_ok=True) # For Swahili monolingual, if you add some
+USER_MONO_TGT_DIR.mkdir(parents=True, exist_ok=True)
 (DATA_ROOT_DIR / "parallel").mkdir(parents=True, exist_ok=True)
-
-
-
-
-# Option 2: Download example data (e.g., English-German from OpusTatoeba)
-# This is primarily for testing the pipeline if luo-swa data is not immediately available.
-# EXAMPLE_DATA_DIR = Path("/content/example_opus_data")
-# EXAMPLE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-# EXAMPLE_SRC_LANG_OPUS = "en"
-# EXAMPLE_TGT_LANG_OPUS = "de"
-# EXAMPLE_CORPUS_NAME = "Tatoeba"  # Opus corpus name
-
-# For creating dummy files if no data is provided at all (just for script to not crash immediately)
-# This allows testing parts of the pipeline structure.
-# CREATE_DUMMY_DATA_IF_NONE_EXIST = False
 
 # Model checkpoints
 TEACHER_CKPT = 'facebook/nllb-200-distilled-600M'
 STUDENT_CKPT = 'google/mt5-small'
+STUDENT_USE_BNB_FOR_PEFT = True # QLoRA-style training of student
+
+
+# Task Prefixes for Bidirectional Student Model
+TASK_PREFIX_LUO_TO_SWA = "translate Dholuo to Swahili: "
+TASK_PREFIX_SWA_TO_LUO = "translate Swahili to Dholuo: "
 
 # Character CNN parameters
 CHAR_EMB_DIM = 64  # Reduced for memory
 CHAR_CNN_KERNEL_SIZES = [2, 3, 4]  # Fewer/smaller kernels
 CHAR_CNN_NUM_FILTERS = 64  # Reduced number of filters
+CHAR_CNN_OUTPUT_DIM_RATIO = 0.25 # CharCNN output dim = d_model * this ratio
+
 
 # Special character tokens
 CHAR_PAD_TOKEN = "<CPAD>"  # Character PAD
@@ -144,20 +98,24 @@ SPECIAL_CHAR_TOKENS = [CHAR_PAD_TOKEN, CHAR_UNK_TOKEN, CHAR_SOW_TOKEN, CHAR_EOW_
 # Training hyperparameters
 MAX_SUBWORD_SEQ_LEN = 128
 MAX_CHAR_LEN_PER_SUBWORD = 16  # Max characters per subword token (for padding char sequences), INCLUDES SOW/EOW
-BATCH_SIZE = 8  # For Colab Free GPU. For T4, can try 16.
+BATCH_SIZE = 16  # For Colab Free GPU. For T4, can try 16.
 GRAD_ACCUM_STEPS = 4  # Effective batch size = BATCH_SIZE * GRAD_ACCUM_STEPS (32)
 LEARNING_RATE = 3e-4  # Slightly higher for smaller models / from-scratch components
 WEIGHT_DECAY = 0.01
 NUM_EPOCHS = 5  # Increase for real training (e.g., 10-20)
 KD_ALPHA = 0.7
 REP_ALPHA = 0.3
-PATIENT_REP_LAYERS = [-1]  # Distill from last encoder hidden layer
+KD_TEMPERATURE = 2.0
+PATIENT_REP_LAYERS_INDICES = [-1] # Distill from last encoder hidden layer
+PEFT_LORA_R = 8
+PEFT_LORA_ALPHA = 16
+PEFT_LORA_DROPOUT = 0.05
 
 # Evaluation & Logging
 EVAL_STEPS = 250  # Evaluate more frequently for low-resource
 LOGGING_STEPS = 50
 SAVE_STEPS = 500
-SAVE_TOTAL_LIMIT = 2
+SAVE_TOTAL_LIMIT = 3
 EARLY_STOPPING_PATIENCE = 3
 
 # Metrics - initialize once
@@ -167,6 +125,8 @@ bertscore_metric = evaluate.load('bertscore')
 comet_metric = None  # Initialize later due to potential download/resource issues
 BLEURT_CKPT = 'BLEURT-20'  # General purpose checkpoint
 bleurt_metric = None
+
+STUDENT_USE_BNB = True
 
 try:
     comet_metric = evaluate.load('comet', config_name='eamt22-cometinho-da')  # Smaller COMET model
@@ -182,66 +142,6 @@ except Exception as e:
 
 sbert_model = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
 
-
-# -----------------------
-# DATA HELPER FUNCTIONS
-# -----------------------
-def load_and_process_parallel_files(self, src_file_path: Path, tgt_file_path: Path,
-                                    src_lang_iso_for_segmentation: str,
-                                    tgt_lang_iso_for_segmentation: str,
-                                    src_lang_for_linguistic_processing: str,
-                                    tgt_lang_for_linguistic_processing: str
-                                    ) -> List[Dict[str, str]]:
-    """
-    Loads and processes parallel text files (Moses format: one file per language).
-    Sentences are assumed to be line-aligned between the two files.
-    """
-    pairs = []
-    if not src_file_path.exists() or not tgt_file_path.exists():
-        logger.warning(f"Parallel files not found: {src_file_path} or {tgt_file_path}")
-        return pairs
-
-    try:
-        with open(src_file_path, 'r', encoding='utf-8') as f_src, \
-                open(tgt_file_path, 'r', encoding='utf-8') as f_tgt:
-
-            for line_num, (src_line, tgt_line) in enumerate(tqdm(zip(f_src, f_tgt),
-                                                                 desc=f"Processing parallel {src_lang_iso_for_segmentation}-{tgt_lang_iso_for_segmentation}")):
-                raw_src_sent = src_line.strip()
-                raw_tgt_sent = tgt_line.strip()
-
-                if not raw_src_sent or not raw_tgt_sent:
-                    # logger.debug(f"Skipping empty line at {line_num+1} in parallel files.")
-                    continue
-
-                cleaned_src = self.preprocessor.clean_text(raw_src_sent)
-                cleaned_tgt = self.preprocessor.clean_text(raw_tgt_sent)
-
-                # Linguistic processing (currently minimal, mostly lowercasing is done by clean_text)
-                if src_lang_for_linguistic_processing == SRC_LANG_SHORT:  # Dholuo
-                    final_src = self.preprocessor.linguistic_process_dholuo(cleaned_src)
-                else:
-                    final_src = cleaned_src  # Assuming clean_text already lowercased
-
-                if tgt_lang_for_linguistic_processing == TGT_LANG_SHORT:  # Swahili
-                    final_tgt = self.preprocessor.linguistic_process_swahili(cleaned_tgt)
-                else:
-                    final_tgt = cleaned_tgt  # Assuming clean_text already lowercased
-
-                if final_src and final_tgt:  # Ensure both are non-empty after all processing
-                    pairs.append({
-                        SRC_LANG_SHORT: final_src,
-                        TGT_LANG_SHORT: final_tgt
-                    })
-                # else:
-                # logger.debug(f"Pair became empty after processing at line {line_num+1}")
-    except Exception as e:
-        logger.error(f"Error processing parallel files {src_file_path}, {tgt_file_path}: {e}")
-    return pairs
-
-# -----------------------
-# METRICS COMPUTATION
-# -----------------------
 def compute_metrics_fn(eval_preds, tokenizer: AutoTokenizer, dataset_for_comet_src: Optional[List[str]] = None):
     preds, labels = eval_preds
     if isinstance(preds, tuple): preds = preds[0]  # Beam search might return a tuple
@@ -335,455 +235,436 @@ def main():
     logger.info(PROJECT_NAME)
     logger.info(f"Starting pipeline on device: {DEVICE}")
 
-    # --- 0. Determine active language settings ---
-    global SRC_LANG_NLLB, TGT_LANG_NLLB, SRC_LANG_SHORT, TGT_LANG_SHORT
-    active_src_lang_nllb = SRC_LANG_NLLB
-    active_tgt_lang_nllb = TGT_LANG_NLLB
-    active_src_lang_short = SRC_LANG_SHORT
-    active_tgt_lang_short = TGT_LANG_SHORT
+    logger.info("file processing for multitask training.")
+    active_src_lang_short_main, active_tgt_lang_short_main = SRC_LANG_SHORT, TGT_LANG_SHORT  # luo, swa
+    active_src_nllb_main, active_tgt_nllb_main = SRC_LANG_NLLB, TGT_LANG_NLLB  # luo_Latn, swa_Latn
 
-    logger.info("Using user-defined Dholuo-Swahili data paths.")
-    parallel_train_src_file = USER_PARALLEL_TRAIN_SRC_FILE
-    parallel_train_tgt_file = USER_PARALLEL_TRAIN_TGT_FILE
-    parallel_dev_src_file = USER_PARALLEL_DEV_SRC_FILE
-    parallel_dev_tgt_file = USER_PARALLEL_DEV_TGT_FILE
-    mono_src_dir = USER_MONO_SRC_DIR
-    mono_tgt_dir = USER_MONO_TGT_DIR
+    mono_lang1_dir = USER_MONO_SRC_DIR  # Dholuo mono
+    mono_lang2_dir = USER_MONO_TGT_DIR  # Swahili mono
 
+    para_lang1_file = USER_PARALLEL_TRAIN_SRC_FILE  # train.luo
+    para_lang2_file = USER_PARALLEL_TRAIN_TGT_FILE  # train.swa
+    para_dev_lang1_file = USER_PARALLEL_DEV_SRC_FILE  # dev.luo
+    para_dev_lang2_file = USER_PARALLEL_DEV_TGT_FILE  # dev.swa
 
-
-    # --- 1. Load and Preprocess Data ---
-    text_preprocessor = TextPreprocessor(src_lang_short_code=active_src_lang_short,
-                                         tgt_lang_short_code=active_tgt_lang_short)
+    # --- 1. Text Preprocessor (Generic for both languages) ---
+    text_preprocessor = TextPreprocessor(
+        src_lang_short_code=active_src_lang_short_main,  # For default behavior if lang not specific
+        tgt_lang_short_code=active_tgt_lang_short_main
+    )
     file_processor = FileProcessor(text_preprocessor)
 
-    logger.info("Loading and processing monolingual source data...")
-    mono_src_sentences = file_processor.load_and_process_monolingual_dir(
-        mono_src_dir, active_src_lang_short, active_src_lang_short
+    # --- 2. Load Raw Data ---
+    # Monolingual data for language 1 (e.g., Dholuo or English)
+    mono_l1_sentences = file_processor.load_and_process_monolingual_dir(
+        mono_lang1_dir, active_src_lang_short_main
     )
-    logger.info(
-        "Loading and processing monolingual target data...")  # For potential future use (e.g. backtranslation on target)
-    mono_tgt_sentences = file_processor.load_and_process_monolingual_dir(
-        mono_tgt_dir, active_tgt_lang_short, active_tgt_lang_short
+    # Monolingual data for language 2 (e.g., Swahili or German)
+    mono_l2_sentences = file_processor.load_and_process_monolingual_dir(
+        mono_lang2_dir, active_tgt_lang_short_main
     )
 
-    logger.info("Loading and processing parallel training data...")
-    parallel_train_pairs = file_processor.load_and_process_parallel_files(
-        parallel_train_src_file, parallel_train_tgt_file,
-        active_src_lang_short, active_tgt_lang_short,
-        active_src_lang_short, active_tgt_lang_short
+    # Parallel data (content is lang1 <-> lang2)
+    # FileProcessor returns dict with actual lang keys e.g. {'luo': ..., 'swa': ...} or {'en':..., 'de':...}
+    parallel_train_raw_pairs = file_processor.load_and_process_parallel_files(
+        para_lang1_file, para_lang2_file, active_src_lang_short_main, active_tgt_lang_short_main
     )
-    if not parallel_train_pairs:
-        logger.error("No parallel training data loaded. Exiting.")
-        return
-
-    parallel_dev_pairs = []
-    if parallel_dev_src_file and parallel_dev_tgt_file and \
-            parallel_dev_src_file.exists() and parallel_dev_tgt_file.exists():
-        logger.info("Loading and processing parallel dev data...")
-        parallel_dev_pairs = file_processor.load_and_process_parallel_files(
-            parallel_dev_src_file, parallel_dev_tgt_file,
-            active_src_lang_short, active_tgt_lang_short,
-            active_src_lang_short, active_tgt_lang_short
-        )
-    if not parallel_dev_pairs:  # If no dev set, take a small slice from train
-        logger.warning("No parallel dev data found or loaded. Will attempt to split from training data.")
-        if len(parallel_train_pairs) > 100:  # Ensure enough data for a split
-            split_idx = min(500, int(len(parallel_train_pairs) * 0.05))  # 5% or max 500 for dev
-            if split_idx == 0 and len(parallel_train_pairs) > 1: split_idx = 1  # Ensure at least 1 for dev
-            parallel_dev_pairs = parallel_train_pairs[:split_idx]
-            parallel_train_pairs = parallel_train_pairs[split_idx:]
-            logger.info(f"Created dev set with {len(parallel_dev_pairs)} pairs from training data.")
-        else:
-            logger.error("Not enough training data to create a dev split. Dev set will be empty.")
-            parallel_dev_pairs = []
-
-    authentic_parallel_train_ds = HFDataset.from_list(parallel_train_pairs)
-    authentic_parallel_dev_ds = HFDataset.from_list(parallel_dev_pairs) if parallel_dev_pairs else None
-
-    # --- 2. Synthetic Data Generation & Filtering ---
-    synthetic_train_ds = None
-    if mono_src_sentences:
-        logger.info(f"Initializing synthetic data generator for {active_src_lang_nllb} to {active_tgt_lang_nllb}...")
-        synth_generator_filter = SyntheticDataGeneratorAndFilter(
-            teacher_model_name_or_path=TEACHER_CKPT,
-            sbert_model_name=sbert_model,
-            src_lang_nllb_code=active_src_lang_nllb,
-            tgt_lang_nllb_code=active_tgt_lang_nllb,
-            device=DEVICE,
-            use_bnb_for_teacher=True
+    parallel_dev_raw_pairs = []
+    if para_dev_lang1_file and para_dev_lang2_file and para_dev_lang1_file.exists() and para_dev_lang2_file.exists():
+        parallel_dev_raw_pairs = file_processor.load_and_process_parallel_files(
+            para_dev_lang1_file, para_dev_lang2_file, active_src_lang_short_main, active_tgt_lang_short_main
         )
 
-        # Convert monolingual list to HFDataset format expected by generator
-        mono_src_hf_ds = HFDataset.from_dict({"original_src": mono_src_sentences})
+    # --- 3. Create Multitask Dataset from Parallel Data ---
+    multitask_parallel_train_examples = []
+    for pair in parallel_train_raw_pairs:
+        l1_text = pair[active_src_lang_short_main]  # e.g., Dholuo text
+        l2_text = pair[active_tgt_lang_short_main]  # e.g., Swahili text
 
-        # Limit synthetic data generation for resource constraints if needed
-        # max_synthetic_src_sents = 10000 # Example limit
-        # if len(mono_src_hf_ds) > max_synthetic_src_sents:
-        # mono_src_hf_ds = mono_src_hf_ds.select(range(max_synthetic_src_sents))
-        # logger.info(f"Limiting synthetic data source to {max_synthetic_src_sents} sentences.")
+        # Direction 1: lang1 -> lang2 (e.g., Luo -> Swahili)
+        multitask_parallel_train_examples.append({
+            "student_input_text": TASK_PREFIX_LUO_TO_SWA + l1_text,
+            "target_text": l2_text,
+            "teacher_input_text": l1_text,  # Unprefixed for teacher
+            "teacher_src_nllb": active_src_nllb_main,  # NLLB code for l1
+            "teacher_tgt_nllb": active_tgt_nllb_main,  # NLLB code for l2
+            "unprefixed_src_for_comet": l1_text  # For metrics
+        })
+        # Direction 2: lang2 -> lang1 (e.g., Swahili -> Luo)
+        multitask_parallel_train_examples.append({
+            "student_input_text": TASK_PREFIX_LUO_TO_SWA + l2_text,
+            "target_text": l1_text,
+            "teacher_input_text": l2_text,  # Unprefixed for teacher
+            "teacher_src_nllb": active_tgt_nllb_main,  # NLLB code for l2
+            "teacher_tgt_nllb": active_src_nllb_main,  # NLLB code for l1
+            "unprefixed_src_for_comet": l2_text  # For metrics
+        })
 
-        synthetic_pairs_raw_list = synth_generator_filter.generate_synthetic_data(
-            mono_src_hf_ds["original_src"],  # Pass the list of strings
-            batch_size=BATCH_SIZE * 2  # Can use larger batch for inference
+    multitask_parallel_dev_examples = []
+    for pair in parallel_dev_raw_pairs:
+        l1_text = pair[active_src_lang_short_main]
+        l2_text = pair[active_tgt_lang_short_main]
+        multitask_parallel_dev_examples.append({
+            "student_input_text": TASK_PREFIX_LUO_TO_SWA + l1_text,
+            "target_text": l2_text, "teacher_input_text": l1_text,
+            "teacher_src_nllb": active_src_nllb_main, "teacher_tgt_nllb": active_tgt_nllb_main,
+            "unprefixed_src_for_comet": l1_text
+        })
+        multitask_parallel_dev_examples.append({
+            "student_input_text": TASK_PREFIX_SWA_TO_LUO + l2_text,
+            "target_text": l1_text, "teacher_input_text": l2_text,
+            "teacher_src_nllb": active_tgt_nllb_main, "teacher_tgt_nllb": active_src_nllb_main,
+            "unprefixed_src_for_comet": l2_text
+        })
+
+    authentic_parallel_train_ds = HFDataset.from_list(multitask_parallel_train_examples)
+    authentic_parallel_dev_ds = HFDataset.from_list(
+        multitask_parallel_dev_examples) if multitask_parallel_dev_examples else None
+
+    # --- 4. Synthetic Data Generation for Both Directions ---
+    all_synthetic_examples = []
+    global sbert_model  # Ensure sbert_model is accessible
+
+    # Direction 1: L1_mono -> L2_synthetic (e.g., Luo -> Swahili)
+    if mono_l1_sentences:
+        logger.info(f"Generating synthetic data for {active_src_lang_short_main} -> {active_tgt_lang_short_main}")
+        synth_gen_l1_to_l2 = SyntheticDataGeneratorAndFilter(
+            TEACHER_CKPT, TEACHER_CKPT,
+            sbert_model_instance=sbert_model,  # Pass loaded sbert
+            current_src_lang_nllb_code=active_src_nllb_main,
+            current_tgt_lang_nllb_code=active_tgt_nllb_main,
+            device=DEVICE, use_bnb_for_teacher_pipeline=True
         )
-        if synthetic_pairs_raw_list:
-            synthetic_raw_ds = HFDataset.from_list(synthetic_pairs_raw_list)
-            logger.info(f"Generated {len(synthetic_raw_ds)} raw synthetic pairs.")
+        raw_synth_pairs_l1_to_l2 = synth_gen_l1_to_l2.generate_synthetic_data(mono_l1_sentences,
+                                                                              batch_size=BATCH_SIZE * 2)
+        if raw_synth_pairs_l1_to_l2:
+            filtered_synth_l1_to_l2 = synth_gen_l1_to_l2.apply_all_filters(
+                HFDataset.from_list(raw_synth_pairs_l1_to_l2))
+            for item in filtered_synth_l1_to_l2:  # item is {'original_src': ..., 'synthetic_tgt': ...}
+                all_synthetic_examples.append({
+                    "student_input_text": TASK_PREFIX_LUO_TO_SWA + item["original_src"],
+                    "target_text": item["synthetic_tgt"],
+                    "teacher_input_text": item["original_src"],
+                    "teacher_src_nllb": active_src_nllb_main,
+                    "teacher_tgt_nllb": active_tgt_nllb_main,
+                    "unprefixed_src_for_comet": item["original_src"]
+                })
+        del synth_gen_l1_to_l2.teacher_model;
+        del synth_gen_l1_to_l2;
+        gc.collect();
+        torch.cuda.empty_cache()
 
-            synthetic_train_ds = synth_generator_filter.apply_all_filters(
-                synthetic_raw_ds,
-                rtt_threshold=0.40,  # chrF score for RTT
-                semantic_threshold=0.65,  # SBERT cosine similarity
-                lm_fluency_threshold_tgt=-4.0  # Negative log loss for fluency of synthetic target
-            )
-            logger.info(f"Filtered synthetic dataset size: {len(synthetic_train_ds)}")
-        else:
-            logger.warning("No synthetic pairs were generated.")
-            synthetic_train_ds = HFDataset.from_list([])  # Empty dataset
-
-        # Clean up large teacher model from Synth Generator if no longer needed explicitly
-        del synth_generator_filter.teacher_model
-        del synth_generator_filter
+    # Direction 2: L2_mono -> L1_synthetic (e.g., Swahili -> Luo)
+    if mono_l2_sentences:
+        logger.info(f"Generating synthetic data for {active_tgt_lang_short_main} -> {active_src_lang_short_main}")
+        synth_gen_l2_to_l1 = SyntheticDataGeneratorAndFilter(
+            TEACHER_CKPT, TEACHER_CKPT,
+            sbert_model_instance=sbert_model,
+            current_src_lang_nllb_code=active_tgt_nllb_main,  # Swapped
+            current_tgt_lang_nllb_code=active_src_nllb_main,  # Swapped
+            device=DEVICE, use_bnb_for_teacher_pipeline=True
+        )
+        raw_synth_pairs_l2_to_l1 = synth_gen_l2_to_l1.generate_synthetic_data(mono_l2_sentences,
+                                                                              batch_size=BATCH_SIZE * 2)
+        if raw_synth_pairs_l2_to_l1:
+            filtered_synth_l2_to_l1 = synth_gen_l2_to_l1.apply_all_filters(
+                HFDataset.from_list(raw_synth_pairs_l2_to_l1))
+            for item in filtered_synth_l2_to_l1:
+                all_synthetic_examples.append({
+                    "student_input_text": TASK_PREFIX_SWA_TO_LUO + item["original_src"],
+                    "target_text": item["synthetic_tgt"],
+                    "teacher_input_text": item["original_src"],
+                    "teacher_src_nllb": active_tgt_nllb_main,  # Swapped
+                    "teacher_tgt_nllb": active_src_nllb_main,  # Swapped
+                    "unprefixed_src_for_comet": item["original_src"]
+                })
+        del synth_gen_l2_to_l1.teacher_model
+        del synth_gen_l2_to_l1
         gc.collect()
-        if DEVICE == 'cuda': torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
-    # --- 3. Combine Datasets ---
-    if synthetic_train_ds and len(synthetic_train_ds) > 0:
-        # Ensure columns match for concatenation: 'luo', 'swa' (or active_src_lang_short, active_tgt_lang_short)
-        # Synthetic data from generator has 'original_src' and 'synthetic_tgt'
-        synthetic_train_ds = synthetic_train_ds.rename_column("original_src", active_src_lang_short)
-        synthetic_train_ds = synthetic_train_ds.rename_column("synthetic_tgt", active_tgt_lang_short)
-        final_train_ds = concatenate_datasets([authentic_parallel_train_ds, synthetic_train_ds]).shuffle(seed=42)
-    else:
-        final_train_ds = authentic_parallel_train_ds.shuffle(seed=42)
+    # --- 5. Combine all data and create final train/eval splits ---
+    final_train_ds_list = [authentic_parallel_train_ds]
+    if all_synthetic_examples:
+        final_train_ds_list.append(HFDataset.from_list(all_synthetic_examples))
 
-    final_eval_ds = authentic_parallel_dev_ds
-    if not final_eval_ds or len(final_eval_ds) == 0:
-        # Create a minimal eval set from training if none exists
-        if len(final_train_ds) > 20:  # Need at least some data to split
-            logger.warning(
-                "No evaluation dataset provided or created. Splitting 10 examples from training data for evaluation.")
-            split = final_train_ds.train_test_split(test_size=min(10, len(final_train_ds) - 1),
-                                                    shuffle=False)  # Minimal eval
-            final_train_ds = split['train']
-            final_eval_ds = split['test']
-        else:
-            logger.error("Not enough data for train/eval split. Evaluation will be problematic.")
-            # Fallback: use a tiny part of train for eval if trainer requires it.
-            # This is not ideal for actual model assessment.
-            final_eval_ds = final_train_ds.select(range(min(1, len(final_train_ds))))
-
-    logger.info(f"Total training samples: {len(final_train_ds)}")
-    logger.info(f"Total evaluation samples: {len(final_eval_ds)}")
-    if len(final_train_ds) == 0:
-        logger.error("No training data available. Exiting.")
+    if not final_train_ds_list[0] and (len(final_train_ds_list) == 1 or not final_train_ds_list[1]):
+        logger.error("No authentic parallel data and no synthetic data. Cannot train.")
         return
 
-    # --- 4. Character Vocabulary Building ---
-    logger.info("Loading student tokenizer for character vocabulary building...")
-    # Use the student's tokenizer to get subwords whose characters will form the char vocab
-    # NLLB tokenizer needs src_lang for its internal state for proper tokenization if it's language-specific
-    # For mT5, it's usually language-agnostic by default unless a task prefix is used.
-    student_subword_tokenizer_for_char_vocab = AutoTokenizer.from_pretrained(
-        STUDENT_CKPT,
-        src_lang=active_src_lang_nllb,  # For NLLB student base
-        # For mT5, src_lang might not be needed here, but doesn't hurt for NLLB compatibility
-    )
+    final_train_ds = concatenate_datasets(final_train_ds_list).shuffle(seed=42)
+
+    final_eval_ds = authentic_parallel_dev_ds  # Use dev set from bidirectional parallel data
+    if not final_eval_ds or len(final_eval_ds) == 0:
+        if len(final_train_ds) > 40:  # Need more for multitask eval
+            logger.warning("No evaluation dataset. Splitting from combined training data for multitask evaluation.")
+            split_size = min(max(20, int(len(final_train_ds) * 0.01)), 1000)
+            if len(final_train_ds) - split_size < 1: split_size = len(final_train_ds) - 1
+            if split_size > 0:
+                split = final_train_ds.train_test_split(test_size=split_size, shuffle=True,
+                                                        seed=42)  # Shuffle before split
+                final_train_ds, final_eval_ds = split['train'], split['test']
+        else:
+            logger.error("Not enough data for train/eval split. Evaluation will use training data.")
+            final_eval_ds = final_train_ds.select(range(min(max(1, len(final_train_ds) // 2), 20)))  # Tiny eval
+
+    logger.info(f"Multitask Training: Total training samples: {len(final_train_ds)}")
+    logger.info(f"Multitask Training: Total evaluation samples: {len(final_eval_ds)}")
+    if len(final_train_ds) == 0: logger.error("No training data. Exiting."); return
+
+    # --- 6. Joint Character Vocabulary ---
+    logger.info("Building joint character vocabulary for multitask model...")
+    # For student (mT5), tokenizer doesn't typically need src_lang for general tokenization
+    # unless it's specifically an NLLB-family tokenizer being used as student.
+    # For vocab building, any consistent tokenizer that gives subword strings is okay.
+    # NLLB tokenizer with a default lang (like 'eng_Latn') is fine for getting chars of its vocab.
+    tokenizer_for_char_vocab_build = AutoTokenizer.from_pretrained(STUDENT_CKPT,
+                                                                   src_lang="eng_Latn" if "nllb" in STUDENT_CKPT.lower() else None)
+
+    texts_for_char_vocab = mono_l1_sentences + mono_l2_sentences
+    for ex in final_train_ds: texts_for_char_vocab.append(ex['teacher_input_text']); texts_for_char_vocab.append(
+        ex['target_text'])
+    if final_eval_ds:
+        for ex in final_eval_ds: texts_for_char_vocab.append(ex['teacher_input_text']); texts_for_char_vocab.append(
+            ex['target_text'])
 
     char_vocab_builder = CharacterVocabulary(special_tokens=SPECIAL_CHAR_TOKENS)
-    # Collect all unique sentences from train and eval to build comprehensive char vocab
-    all_text_for_char_vocab = []
-    all_text_for_char_vocab.extend(final_train_ds[active_src_lang_short])
-    all_text_for_char_vocab.extend(final_train_ds[active_tgt_lang_short])
-    if final_eval_ds and len(final_eval_ds) > 0:
-        all_text_for_char_vocab.extend(final_eval_ds[active_src_lang_short])
-        all_text_for_char_vocab.extend(final_eval_ds[active_tgt_lang_short])
+    char_vocab_builder.build_from_data(
+        texts_for_char_vocab,
+        tokenizer_for_char_vocab_build,
+        task_prefixes=[TASK_PREFIX_LUO_TO_SWA, TASK_PREFIX_SWA_TO_LUO]
+    )
+    del texts_for_char_vocab, tokenizer_for_char_vocab_build;
+    gc.collect()
 
-    char_vocab_builder.build_from_data(all_text_for_char_vocab, student_subword_tokenizer_for_char_vocab)
-
-    # --- 5. Model Initialization ---
-    logger.info("Loading teacher model for distillation...")
-    # Teacher model is needed by DistillationTrainer
-    # Load with BNB if large and on GPU
-    use_bnb_for_teacher_in_trainer = (DEVICE == 'cuda' and "3.3B" in TEACHER_CKPT or "1.3B" in TEACHER_CKPT)
-    if use_bnb_for_teacher_in_trainer:
-        bnb_config_teacher_trainer = BitsAndBytesConfig(
+    # --- 7. Model Initialization (Single Student, Teacher for Distillation) ---
+    logger.info(f"Loading teacher model ({TEACHER_CKPT}) for distillation.")
+    use_bnb_for_teacher_trainer = (DEVICE == 'cuda' and any(s in TEACHER_CKPT for s in ["3.3B", "1.3B", "600M"]))
+    teacher_bnb_config = None
+    if use_bnb_for_teacher_trainer:
+        teacher_bnb_config = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        teacher_model_for_distillation = AutoModelForSeq2SeqLM.from_pretrained(
-            TEACHER_CKPT,
-            quantization_config=bnb_config_teacher_trainer,
-            device_map="auto"
-        )
-        logger.info(f"Teacher model ({TEACHER_CKPT}) loaded with 4-bit BNB for DistillationTrainer.")
-    else:
-        teacher_model_for_distillation = AutoModelForSeq2SeqLM.from_pretrained(TEACHER_CKPT)
-        # No .to(DEVICE) here, trainer will handle it.
-        logger.info(f"Teacher model ({TEACHER_CKPT}) loaded without BNB for DistillationTrainer.")
+            bnb_4bit_use_double_quant=True)
 
-    logger.info(f"Initializing Character-Aware Student Model with base: {STUDENT_CKPT}")
-    # Student tokenizer - this is the main tokenizer for the rest of the pipeline
-    student_tokenizer = AutoTokenizer.from_pretrained(
-        STUDENT_CKPT,
-        src_lang=active_src_lang_nllb,  # For NLLB student base
-        tgt_lang=active_tgt_lang_nllb  # For NLLB student base
+    teacher_model_for_distillation = AutoModelForSeq2SeqLM.from_pretrained(
+        TEACHER_CKPT,
+        quantization_config=teacher_bnb_config,
+        device_map="auto" if teacher_bnb_config else None
     )
+    # The teacher's tokenizer will be loaded dynamically inside DistillationTrainer based on batch's teacher_src_nllb_code
+    if not teacher_bnb_config: teacher_model_for_distillation.to(DEVICE)
+    logger.info(f"Teacher model for distillation loaded ({'BNB' if teacher_bnb_config else 'standard'}).")
+
+    # Student tokenizer (e.g., mT5 tokenizer, generally lang-agnostic for tokenization itself)
+    # NLLB student tokenizer would need src_lang/tgt_lang if STUDENT_CKPT is NLLB.
+    # For mT5, the prefixes handle direction.
+    student_tokenizer_main = AutoTokenizer.from_pretrained(STUDENT_CKPT)
+    if student_tokenizer_main.pad_token is None:
+        student_tokenizer_main.pad_token = student_tokenizer_main.eos_token
+        logger.info(f"Set student tokenizer pad_token to eos_token: {student_tokenizer_main.pad_token}")
 
     student_model = CharacterAwareMTModel(
         base_model_name_or_path=STUDENT_CKPT,
         char_vocab_size=len(char_vocab_builder),
         char_pad_idx=char_vocab_builder.get_pad_id(),
         char_emb_dim=CHAR_EMB_DIM,
-        char_cnn_output_dim_ratio=0.25,  # e.g. 25% of d_model for char features
-        freeze_base_model=False,  # Important: Fine-tune the student, including base
-        freeze_base_embeddings=False,  # Allow subword embeddings of student to be trained
-        use_bnb_quantization=DEVICE
+        char_cnn_output_dim_ratio=CHAR_CNN_OUTPUT_DIM_RATIO,
+        use_bnb_quantization_for_base_before_peft=(STUDENT_USE_BNB_FOR_PEFT and DEVICE == 'cuda'),
+        peft_lora_r=PEFT_LORA_R, peft_lora_alpha=PEFT_LORA_ALPHA, peft_lora_dropout=PEFT_LORA_DROPOUT
     )
-    student_model.to(DEVICE)  # Ensure student model is on the correct device if not using device_map in its __init__
+    if not (STUDENT_USE_BNB_FOR_PEFT and DEVICE == 'cuda'):
+        student_model.to(DEVICE)
+    else:  # Ensure custom parts are on device if base used device_map
+        if student_model.char_cnn: student_model.char_cnn.to(DEVICE)
+        if student_model.projection_layer: student_model.projection_layer.to(DEVICE)
 
-    # --- 6. Prepare Datasets for Training ---
-    logger.info("Creating NMTCharSubwordDataset for training...")
+    # --- 8. Prepare Datasets for Training ---
+    logger.info("Creating NMTCharSubwordDataset for multitask training...")
+    # Teacher tokenizer is needed by dataset to prepare teacher_input_ids.
+    # This is tricky if teacher is NLLB and tokenizer needs src_lang.
+    # We simplified by passing text to trainer.
+    # Here, student_tokenizer is passed, as it tokenizes the student_input_text (with prefix)
     train_torch_dataset = NMTCharSubwordDataset(
         hf_dataset=final_train_ds,
-        subword_tokenizer=student_tokenizer,
+        student_subword_tokenizer=student_tokenizer_main,
+        teacher_subword_tokenizer=None,  # Teacher tokenization handled in DistillationTrainer
         char_vocab=char_vocab_builder,
         max_subword_seq_len=MAX_SUBWORD_SEQ_LEN,
         max_char_len_per_subword_incl_special=MAX_CHAR_LEN_PER_SUBWORD,
-        src_lang_key=active_src_lang_short,
-        tgt_lang_key=active_tgt_lang_short
+        # Columns are now "student_input_text", "target_text", "teacher_input_text", etc.
+        src_data_column_name="student_input_text",  # This has the prefix
+        tgt_data_column_name="target_text"
     )
-    eval_torch_dataset = None
+    eval_torch_dataset, eval_source_texts_for_comet = None, None
     if final_eval_ds and len(final_eval_ds) > 0:
-        logger.info("Creating NMTCharSubwordDataset for evaluation...")
         eval_torch_dataset = NMTCharSubwordDataset(
-            hf_dataset=final_eval_ds,
-            subword_tokenizer=student_tokenizer,
-            char_vocab=char_vocab_builder,
-            max_subword_seq_len=MAX_SUBWORD_SEQ_LEN,
-            max_char_len_per_subword_incl_special=MAX_CHAR_LEN_PER_SUBWORD,
-            src_lang_key=active_src_lang_short,
-            tgt_lang_key=active_tgt_lang_short
+            hf_dataset=final_eval_ds, student_subword_tokenizer=student_tokenizer_main,
+            teacher_subword_tokenizer=None, char_vocab=char_vocab_builder,
+            max_subword_seq_len=MAX_SUBWORD_SEQ_LEN, max_char_len_per_subword_incl_special=MAX_CHAR_LEN_PER_SUBWORD,
+            src_data_column_name="student_input_text", tgt_data_column_name="target_text"
         )
-    else:
-        logger.warning("No evaluation dataset. Trainer will not perform evaluations during training.")
+        eval_source_texts_for_comet = final_eval_ds["teacher_input_text"]  # Unprefixed source for COMET
 
-    # --- 7. Training Arguments and Collator ---
-    # Make sure student_tokenizer has pad_token set if not already.
-    if student_tokenizer.pad_token is None:
-        student_tokenizer.pad_token = student_tokenizer.eos_token  # Common practice for many models
-        student_model.config.pad_token_id = student_tokenizer.eos_token_id
-        logger.info(f"Set student tokenizer pad_token to eos_token: {student_tokenizer.pad_token}")
-
+    # --- 9. Training Arguments and Collator ---
     custom_data_collator = CustomDataCollator(
-        subword_pad_token_id=student_tokenizer.pad_token_id,
+        student_tokenizer=student_tokenizer_main,  # Pass tokenizer for pad_token_id
         char_pad_token_id=char_vocab_builder.get_pad_id(),
         max_char_len_per_subword=MAX_CHAR_LEN_PER_SUBWORD
     )
 
-    # For labels=-100 in DataCollatorForSeq2Seq, but our custom one handles it.
-    # If using DataCollatorForSeq2Seq, it needs model for decoder_input_ids shifting.
-    # data_collator = DataCollatorForSeq2Seq(tokenizer=student_tokenizer, model=student_model, label_pad_token_id=-100)
+    output_dir_multitask = Path("./outputs_multitask_student")
+    output_dir_multitask.mkdir(parents=True, exist_ok=True)
 
-    output_path = Path("./outputs") / f"{active_src_lang_short}_{active_tgt_lang_short}_student"
-    output_path.mkdir(parents=True, exist_ok=True)
+    # Generation config for evaluation (student model)
+    # For mT5, specific lang codes in forced_bos_token_id are not standard.
+    # Generation for mT5 is usually controlled by the prefix in the input.
+    # If STUDENT_CKPT were NLLB, then we would set forced_bos_token_id based on the target of the eval example.
+    # This is complex for compute_metrics with mixed directions.
+    # Simplification: rely on prefix for mT5. If NLLB student, this needs more careful handling in compute_metrics.
+    generation_config_student = GenerationConfig(
+        max_length=MAX_SUBWORD_SEQ_LEN, num_beams=4, early_stopping=True,
+    )
+    # If STUDENT_CKPT is NLLB, this would need to be set dynamically in compute_metrics based on the target lang of the batch.
+    # Since student is mT5, we don't set forced_bos_token_id globally.
 
     training_args = Seq2SeqTrainingArguments(
-        output_dir=str(output_path),
+        output_dir=str(output_dir_multitask),
         evaluation_strategy="steps" if eval_torch_dataset else "no",
         eval_steps=EVAL_STEPS if eval_torch_dataset else None,
-        logging_strategy="steps",
-        logging_steps=LOGGING_STEPS,
-        save_strategy="steps",
-        save_steps=SAVE_STEPS,
+        logging_strategy="steps", logging_steps=LOGGING_STEPS,
+        save_strategy="steps", save_steps=SAVE_STEPS,
         learning_rate=LEARNING_RATE,
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
         weight_decay=WEIGHT_DECAY,
         save_total_limit=SAVE_TOTAL_LIMIT,
         num_train_epochs=NUM_EPOCHS,
-        predict_with_generate=True,  # Essential for BLEU, etc.
-        fp16=torch.cuda.is_available(),  # Enable FP16 if on GPU
+        predict_with_generate=True,
+        fp16=(DEVICE == 'cuda'),
         gradient_accumulation_steps=GRAD_ACCUM_STEPS,
         load_best_model_at_end=True if eval_torch_dataset else False,
-        metric_for_best_model="bleu" if eval_torch_dataset else None,
-        report_to="tensorboard",  # or "wandb"
-        dataloader_num_workers=2 if DEVICE == 'cuda' else 0,  # Can speed up data loading
-        generation_max_length=MAX_SUBWORD_SEQ_LEN,  # For generation during evaluation
-        # For NLLB, need to provide target lang ID for generation
-        # This is usually handled by passing `forced_bos_token_id` to `model.generate`
-        # The `compute_metrics_fn` will use the tokenizer, which if NLLB, needs this.
-        # The trainer's predict_with_generate will call model.generate().
-        # We can pass generation_config to Seq2SeqTrainingArguments.
-        # generation_config = GenerationConfig(forced_bos_token_id=student_tokenizer.lang_code_to_id[active_tgt_lang_nllb])
-        # This requires GenerationConfig to be imported.
-        # Alternatively, the model's forward or generate method might need to be aware or use a generation_config.
-        # For NLLB, the tokenizer usually prepares decoder_input_ids with the target lang code if used `as_target_tokenizer`.
-        # Let's assume for now the tokenizer handles it for labels, and generation needs it explicitly.
-        # The `predict_with_generate` in Trainer calls model.generate.
-        # We might need to wrap the model or customize generate for NLLB target lang id.
-        # For now, we rely on the tokenizer for metric computation to handle it.
-        # If student is NLLB, its generate method can take `forced_bos_token_id`.
-        # The training_args can accept a `generation_config` object.
+        metric_for_best_model="bleu" if eval_torch_dataset else None,  # bleu is generic here
+        report_to="tensorboard",
+        dataloader_num_workers=2 if DEVICE == 'cuda' else 0,  # Be careful on Colab with num_workers > 0
+        generation_config=generation_config_student,
+        # For gradient_checkpointing with PEFT and BNB, need to be careful with model wrapping
+        # gradient_checkpointing=True, # If memory is an issue, but ensure compatibility
     )
-    if "nllb" in STUDENT_CKPT.lower():
-        training_args.generation_config = student_model.config.generation_config
-        training_args.generation_config.forced_bos_token_id = student_tokenizer.lang_code_to_id[active_tgt_lang_nllb]
 
-    # --- 8. Initialize DistillationTrainer ---
     trainer = DistillationTrainer(
         teacher_model=teacher_model_for_distillation,
-        model=student_model,
+        model=student_model,  # This is the CharacterAwareMTModel instance
         args=training_args,
         train_dataset=train_torch_dataset,
         eval_dataset=eval_torch_dataset,
-        tokenizer=student_tokenizer,  # Used for decoding predictions for metrics
+        tokenizer=student_tokenizer_main,  # For decoding preds in compute_metrics
         data_collator=custom_data_collator,
-        compute_metrics=lambda p: compute_metrics_fn(p, student_tokenizer,final_eval_ds[active_src_lang_short] if final_eval_ds else None) \
+        compute_metrics=lambda p: compute_metrics_fn(p, student_tokenizer_main, eval_source_texts_for_comet) \
             if eval_torch_dataset else None,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=EARLY_STOPPING_PATIENCE)] if eval_torch_dataset else [],
-        kd_alpha=KD_ALPHA,
-        rep_alpha=REP_ALPHA,
-        # rep_layers_indices=PATIENT_REP_LAYERS_INDICES,
-        # temperature=KD_TEMPERATURE
+        kd_alpha=KD_ALPHA, rep_alpha=REP_ALPHA,
+        rep_layers_indices=PATIENT_REP_LAYERS_INDICES, temperature=KD_TEMPERATURE
     )
 
-    # --- 9. Train ---
-    logger.info("Starting training...")
+    # --- 10. Train ---
+    logger.info("Starting multitask training...")
     try:
         trainer.train()
     except Exception as e:
-        logger.error(f"Error during training: {e}", exc_info=True)
+        logger.error(f"Error during multitask training: {e}", exc_info=True)
         raise
 
-    # --- 10. Evaluate and Save ---
+    # --- 11. Evaluate and Save ---
     if eval_torch_dataset:
-        logger.info("Evaluating final model on the evaluation set...")
-        eval_results = trainer.evaluate(metric_key_prefix="final_eval")
-        logger.info(f"Final evaluation results: {eval_results}")
-        for key, value in eval_results.items():
-            print(f"{key}: {value}")
+        logger.info("Evaluating final multitask model...")
+        eval_results = trainer.evaluate(metric_key_prefix="final_eval_multitask")
+        logger.info(f"Final multitask evaluation results: {eval_results}")
+        for key, value in eval_results.items(): print(f"Multitask - {key}: {value}")
 
-    final_model_path = output_path / "final_character_aware_student_model"
-    trainer.save_model(str(final_model_path))  # Saves the student_model (CharacterAwareMTModel)
-    student_tokenizer.save_pretrained(str(final_model_path))  # Save tokenizer too
-    logger.info(f"Final student model saved to {final_model_path}")
+    final_model_peft_path = output_dir_multitask / "final_multitask_student_peft_adapter"
+    trainer.save_model(str(final_model_peft_path))  # Saves PEFT adapter & custom layers
+    student_tokenizer_main.save_pretrained(str(final_model_peft_path))
+    logger.info(f"Final multitask student PEFT model saved to {final_model_peft_path}")
 
-    # --- 11. Optional: Quantization of the base model part for deployment ---
-    # Note: Quantizing the CharacterAwareMTModel directly with from_pretrained might be tricky.
-    # This part assumes you might want to deploy only the base_model part after fine-tuning its weights.
-    # If CharacterAwareMTModel's `save_pretrained` is fully compatible, this might work.
-    # The original script did this on the output of trainer.save_model.
+    # --- 12. Merge PEFT and Quantize (Optional) ---
     try:
-        logger.info(f"Attempting to load and quantize the saved base model from {final_model_path} (if applicable)")
-        # If CharacterAwareMTModel saves its base_model in a 'base_model' subfolder:
-        base_model_saved_path = final_model_path / "base_model"
-        if base_model_saved_path.exists():
+        logger.info(
+            f"Loading base student model ({STUDENT_CKPT}) for merging PEFT adapter from {final_model_peft_path}")
+        base_model_for_merge = AutoModelForSeq2SeqLM.from_pretrained(STUDENT_CKPT).to(DEVICE)
 
-            quant_config = BitsAndBytesConfig(
-                load_in_8bit=True
-                # For 8-bit, other params like bnb_8bit_quant_type can be set if needed.
-            )
-            # Load the base model specifically for quantization
-            quantized_base_model = AutoModelForSeq2SeqLM.from_pretrained(
-                base_model_saved_path,  # Path to the saved base_model component
-                quantization_config=quant_config,
-                device_map="auto"  # Or specific device
-            )
-            quantized_model_save_path = final_model_path / "base_model_int8"
-            quantized_base_model.save_pretrained(str(quantized_model_save_path))
-            student_tokenizer.save_pretrained(str(quantized_model_save_path))  # Save tokenizer with it
-            logger.info(f"8-bit quantized base model saved to {quantized_model_save_path}")
-        else:
-            logger.warning(f"Base model not found at {base_model_saved_path} for quantization. "
-                           "Quantization step skipped. This is expected if custom model doesn't save base separately in that exact path.")
+        peft_model_for_merge = PeftModel.from_pretrained(base_model_for_merge, str(final_model_peft_path))
+        peft_model_for_merge.eval()
+        merged_model = peft_model_for_merge.merge_and_unload()
+        logger.info("Successfully merged PEFT adapter into base model for multitask student.")
 
+        merged_model_save_path = output_dir_multitask / "final_multitask_student_merged_model"
+        merged_model.save_pretrained(str(merged_model_save_path))
+        student_tokenizer_main.save_pretrained(str(merged_model_save_path))
+        logger.info(f"Merged multitask student model saved to {merged_model_save_path}")
+
+        if DEVICE == 'cuda':
+            logger.info("Quantizing the merged multitask model to 8-bit...")
+            quant_config_bnb = BitsAndBytesConfig(load_in_8bit=True)
+            quantized_merged_model = AutoModelForSeq2SeqLM.from_pretrained(
+                str(merged_model_save_path),
+                quantization_config=quant_config_bnb, device_map="auto"
+            )
+            quantized_save_path = output_dir_multitask / "final_multitask_student_merged_quantized_int8"
+            quantized_merged_model.save_pretrained(str(quantized_save_path))
+            student_tokenizer_main.save_pretrained(str(quantized_save_path))
+            logger.info(f"8-bit quantized merged multitask model saved to {quantized_save_path}")
+            del quantized_merged_model
+        del base_model_for_merge, peft_model_for_merge, merged_model
     except Exception as e:
-        logger.error(f"Error during quantization: {e}", exc_info=True)
+        logger.error(f"Error during PEFT merging/quantization for multitask model: {e}", exc_info=True)
 
-    # --- 12. Example Inference (using the full CharacterAwareMTModel) ---
+    # --- 13. Example Inference for Multitask Model ---
     try:
-        logger.info("Loading saved CharacterAwareMTModel for inference test...")
-        # Load the custom model using its from_pretrained method
-        loaded_student_model = CharacterAwareMTModel.from_pretrained(str(final_model_path))
-        loaded_student_model.to(DEVICE)
-        loaded_student_model.eval()
+        logger.info("Loading merged multitask student model for inference test...")
+        # For inference, use the merged model (or the PEFT model directly before merging)
+        # If CharacterAwareMTModel architecture is needed, then load CharCNN/Projection separately
+        # and attach to the merged_model (if it's just the transformer part).
+        # Here, we'll use the merged transformer part directly.
 
-        test_sentence_src = ""
-        if final_eval_ds and len(final_eval_ds) > 0:
-            test_sentence_src = final_eval_ds[0][active_src_lang_short]
-        elif final_train_ds and len(final_train_ds) > 0:
-            test_sentence_src = final_train_ds[0][active_src_lang_short]
-        else:
-            test_sentence_src = "Jothurwa welo." if active_src_lang_short == "luo" else "Example source sentence."
+        # Load the non-quantized merged model for inference test
+        inference_model = AutoModelForSeq2SeqLM.from_pretrained(
+            str(output_dir_multitask / "final_multitask_student_merged_model")).to(DEVICE)
+        inference_tokenizer = AutoTokenizer.from_pretrained(
+            str(output_dir_multitask / "final_multitask_student_merged_model"))
+        inference_model.eval()
 
-        logger.info(f"Test inference with sentence: '{test_sentence_src}'")
+        test_luo_sentence = "An gima ber miwuoro."  # Example Dholuo
+        test_swa_sentence = "Hii ni habari njema sana."  # Example Swahili
 
-        # Prepare input for CharacterAwareMTModel
-        inputs = student_tokenizer(test_sentence_src, return_tensors="pt", truncation=True,
-                                   max_length=MAX_SUBWORD_SEQ_LEN)
-        input_ids = inputs["input_ids"].to(DEVICE)
-        attention_mask = inputs["attention_mask"].to(DEVICE)
-
-        src_subword_strings_inf = student_tokenizer.convert_ids_to_tokens(input_ids.squeeze().tolist(),
-                                                                          skip_special_tokens=False)
-        source_char_ids_inf_list = []
-        for sub_str in src_subword_strings_inf:
-            source_char_ids_inf_list.append(
-                torch.tensor(char_vocab_builder.encode_subword_string(sub_str, MAX_CHAR_LEN_PER_SUBWORD),
-                             dtype=torch.long))
-
-        # Collate this single example's char_ids (pad subword sequence dim)
-        padded_char_ids_inf = torch.full(
-            (1, input_ids.size(1), MAX_CHAR_LEN_PER_SUBWORD),
-            fill_value=char_vocab_builder.get_pad_id(), dtype=torch.long
-        )
-        for i, char_tensor in enumerate(source_char_ids_inf_list):
-            padded_char_ids_inf[0, i, :] = char_tensor
-        source_char_ids_inf_tensor = padded_char_ids_inf.to(DEVICE)
-
+        # Test Luo -> Swahili
+        input_text_l2s = TASK_PREFIX_LUO_TO_SWA + test_luo_sentence
+        inputs_l2s = inference_tokenizer(input_text_l2s, return_tensors="pt").to(DEVICE)
         with torch.no_grad():
-            generation_kwargs = {}
-            if "nllb" in STUDENT_CKPT.lower():
-                generation_kwargs["forced_bos_token_id"] = student_tokenizer.lang_code_to_id[active_tgt_lang_nllb]
+            outputs_l2s = inference_model.generate(**inputs_l2s, max_length=MAX_SUBWORD_SEQ_LEN, num_beams=4)
+        translation_l2s = inference_tokenizer.decode(outputs_l2s[0], skip_special_tokens=True)
+        logger.info(
+            f"Luo->Swahili | Source: '{test_luo_sentence}' | Prefixed Input: '{input_text_l2s}' | Translated: '{translation_l2s}'")
 
-            output_ids = loaded_student_model.base_model.generate(  # Call generate on the underlying base_model
-                inputs_embeds=loaded_student_model(input_ids=input_ids, source_char_ids=source_char_ids_inf_tensor,
-                                                   attention_mask=attention_mask).inputs_embeds,
-                # Get the combined embeds
-                attention_mask=attention_mask,  # Pass original attention mask
-                max_length=MAX_SUBWORD_SEQ_LEN,
-                num_beams=4,
-                early_stopping=True,
-                **generation_kwargs
-            )
-        translation = student_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-        logger.info(f"Source ({active_src_lang_short}): {test_sentence_src}")
-        logger.info(f"Translated ({active_tgt_lang_short}): {translation[0]}")
+        # Test Swahili -> Luo
+        input_text_s2l = TASK_PREFIX_SWA_TO_LUO + test_swa_sentence
+        inputs_s2l = inference_tokenizer(input_text_s2l, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            outputs_s2l = inference_model.generate(**inputs_s2l, max_length=MAX_SUBWORD_SEQ_LEN, num_beams=4)
+        translation_s2l = inference_tokenizer.decode(outputs_s2l[0], skip_special_tokens=True)
+        logger.info(
+            f"Swa->Luo | Source: '{test_swa_sentence}' | Prefixed Input: '{input_text_s2l}' | Translated: '{translation_s2l}'")
+
+        del inference_model
 
     except Exception as e:
-        logger.error(f"Error during example inference: {e}", exc_info=True)
+        logger.error(f"Error during multitask inference test: {e}", exc_info=True)
 
-    logger.info(f"{PROJECT_NAME} pipeline complete.")
-    logger.info(f"Final models and outputs are in: {output_path}")
-    logger.info("Remember to check TensorBoard logs if report_to='tensorboard' was used.")
+    gc.collect()
+    if DEVICE == 'cuda': torch.cuda.empty_cache()
+    logger.info(f"{PROJECT_NAME} (multitask single student) pipeline complete.")
 
 
 if __name__ == '__main__':
-    # Before running main, ensure opustools-pkg is installed if USE_EXAMPLE_DATA is True
-    # and necessary data files/directories are set up by the user if USE_EXAMPLE_DATA is False.
-    # if USE_EXAMPLE_DATA or CREATE_DUMMY_DATA_IF_NONE_EXIST:  # Check if opus_read is needed
-    #     try:
-    #         subprocess.run(["opus_read", "--help"], capture_output=True, check=True)
-    #         logger.info("opustools-pkg seems to be installed.")
-    #     except (subprocess.CalledProcessError, FileNotFoundError):
-    #         logger.error(
-    #             "opustools-pkg is not installed or not found in PATH, but it's needed for example data or dummy data download might fail.")
-    #         logger.error("Please install it: pip install opustools-pkg")
-    #         # Decide if to exit or proceed if only dummy user data is used and opus_read is not strictly needed.
-    #         # For now, we'll let it try and fail in download_opus_data if needed.
-
     main()

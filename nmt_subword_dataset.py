@@ -9,79 +9,94 @@ from transformers import (AutoTokenizer)
 SRC_LANG_SHORT = "luo"
 TGT_LANG_SHORT = "swa"
 
+
 class NMTCharSubwordDataset(TorchDataset):
     def __init__(self,
                  hf_dataset: HFDataset,
-                 subword_tokenizer: AutoTokenizer,
-                 char_vocab: CharacterVocabulary,
+                 # Expects columns like "student_input_text", "target_text", "teacher_input_text", "teacher_src_nllb", "teacher_tgt_nllb"
+                 student_subword_tokenizer: AutoTokenizer,  # Tokenizer for the student model
+                 teacher_subword_tokenizer: AutoTokenizer,  # Tokenizer for the teacher model (for teacher_input_ids)
+                 char_vocab: 'CharacterVocabulary',
                  max_subword_seq_len: int,
-                 max_char_len_per_subword: int,
-                 src_lang_key: str = SRC_LANG_SHORT,
-                 tgt_lang_key: str = TGT_LANG_SHORT):
+                 max_char_len_per_subword_incl_special: int):
         self.hf_dataset = hf_dataset
-        self.subword_tokenizer = subword_tokenizer
+        self.student_subword_tokenizer = student_subword_tokenizer
+        self.teacher_subword_tokenizer = teacher_subword_tokenizer
         self.char_vocab = char_vocab
         self.max_subword_seq_len = max_subword_seq_len
-        self.max_char_len_per_subword = max_char_len_per_subword
-        self.src_lang_key = src_lang_key
-        self.tgt_lang_key = tgt_lang_key
+        self.max_char_len_per_subword = max_char_len_per_subword_incl_special
 
     def __len__(self):
         return len(self.hf_dataset)
 
     def __getitem__(self, idx) -> Dict[str, Any]:
         example = self.hf_dataset[idx]
-        src_text = example[self.src_lang_key]
-        tgt_text = example[self.tgt_lang_key]
 
-        # Subword tokenization for source
-        # Important: NLLB tokenizer might add lang codes automatically.
-        # For CharCNN input, we want the characters of the *actual text subwords*.
-        # We'll rely on the main model to handle lang codes if it's NLLB.
-        # If student is mT5, it also has its own way of handling languages or multitask.
-        # The subword_tokenizer for CharCNN should ideally NOT add language codes,
-        # or we need to strip them if convert_ids_to_tokens includes them.
-        # For simplicity here, we assume the tokenizer used for char processing
-        # gives clean subwords.
-        src_subword_tokenized = self.subword_tokenizer(
-            src_text,
+        student_input_text = example["student_input_text"]
+        target_text = example["target_text"]
+        teacher_input_text = example["teacher_input_text"]
+        teacher_src_nllb_code = example["teacher_src_nllb"]
+
+        # --- Student Input Processing ---
+        student_tokenized_output = self.student_subword_tokenizer(
+            student_input_text,  # Text already has prefix
             max_length=self.max_subword_seq_len,
             truncation=True,
-            padding=False  # Pad in collate_fn
+            padding=False
         )
-        src_subword_ids = src_subword_tokenized['input_ids']
-        src_attention_mask = src_subword_tokenized['attention_mask']
+        student_input_ids_list = student_tokenized_output['input_ids']
+        student_attention_mask_list = student_tokenized_output['attention_mask']
+        student_subword_strings = self.student_subword_tokenizer.convert_ids_to_tokens(student_input_ids_list,
+                                                                                       skip_special_tokens=False)
 
-        # Character representation for source subwords
-        # `convert_ids_to_tokens` might add special prefixes (like  for SentencePiece)
-        # or decode special tokens like </s>. These should be part of char_vocab.
-        src_subword_strings = self.subword_tokenizer.convert_ids_to_tokens(src_subword_ids, skip_special_tokens=False)
+        student_char_ids_for_each_subword_list = []
+        for subword_str in student_subword_strings:
+            char_ids = self.char_vocab.encode_subword_string(subword_str, self.max_char_len_per_subword)
+            student_char_ids_for_each_subword_list.append(torch.tensor(char_ids, dtype=torch.long))
 
-        src_char_ids_for_subwords = []
-        for subword_str in src_subword_strings:
-            # Handle tokenizer-specific decoding artifacts if necessary.
-            # For NLLB, convert_ids_to_tokens might return things like '<s>', '</s>', 'luo_Latn'
-            # These need to be correctly represented by characters or handled.
-            # The char_vocab.encode_subword is designed to take these strings.
-            char_ids = self.char_vocab.encode_subword(subword_str, self.max_char_len_per_subword)
-            src_char_ids_for_subwords.append(torch.tensor(char_ids, dtype=torch.long))
-
-        # Subword tokenization for target (labels)
-        # For NLLB, target text needs the target language code as prefix during training by the model itself.
-        # The tokenizer for `labels` should prepare it as NLLB expects it.
-        # The `DataCollatorForSeq2Seq` usually handles shifting labels for decoder input ids.
-        # If not using it, we need to be careful. Here, we just tokenize.
-        tgt_subword_tokenized = self.subword_tokenizer(
-            text_target=tgt_text,  # Use text_target for mT5/NLLB style models
-            max_length=self.max_subword_seq_len,
-            truncation=True,
-            padding=False  # Pad in collate_fn
-        )
-        labels = tgt_subword_tokenized['input_ids']
-
-        return {
-            "input_ids": torch.tensor(src_subword_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(src_attention_mask, dtype=torch.long),
-            "source_char_ids": src_char_ids_for_subwords,  # List of tensors, will be padded by collate_fn
-            "labels": torch.tensor(labels, dtype=torch.long),
+        item = {
+            "input_ids": torch.tensor(student_input_ids_list, dtype=torch.long),  # For student model (prefixed)
+            "attention_mask": torch.tensor(student_attention_mask_list, dtype=torch.long),
+            "source_char_ids": student_char_ids_for_each_subword_list,
         }
+
+        # --- Target (Labels) Processing for Student ---
+        if target_text:
+            # Tokenizer for student (e.g. mT5)
+            # For NLLB student, tokenizer needs to be in target_lang mode
+            if "nllb" in self.student_subword_tokenizer.name_or_path.lower():
+                # Temporarily set teacher_tgt_nllb as the target for student NLLB tokenizer
+                # This assumes student and teacher share language codes if student is NLLB
+                # current_student_tgt_nllb = example.get("teacher_tgt_nllb", TGT_LANG_NLLB)  # Fallback
+                with self.student_subword_tokenizer.as_target_tokenizer():  # NLLB style
+                    # NLLB tokenizer uses src_lang for input, target_lang for output.
+                    # It needs to know what language `target_text` is in to prepend correct code if needed.
+                    # This is tricky. Usually, labels don't get language codes prepended by tokenizer,
+                    # model handles that based on forced_bos_token_id or config.
+                    # For `text_target` in NLLB, it expects tokenizer's `tgt_lang` to be set.
+                    # For safety, let's re-init a tokenizer instance for target or ensure it's configured.
+                    # This part is complex for NLLB student.
+                    # Simpler: For mT5, `text_target` is fine. For NLLB, tokenizer(text_target=...) expects tokenizer.tgt_lang.
+                    temp_tgt_tokenizer = AutoTokenizer.from_pretrained(self.student_subword_tokenizer.name_or_path,
+                                                                       src_lang=teacher_src_nllb_code,
+                                                                       tgt_lang=example.get("teacher_tgt_nllb"))
+
+                    tgt_tokenized_output = temp_tgt_tokenizer(
+                        text_target=target_text,
+                        max_length=self.max_subword_seq_len, truncation=True, padding=False
+                    )
+            else:  # For mT5 and similar
+                tgt_tokenized_output = self.student_subword_tokenizer(
+                    text_target=target_text,
+                    max_length=self.max_subword_seq_len, truncation=True, padding=False
+                )
+            item["labels"] = torch.tensor(tgt_tokenized_output['input_ids'], dtype=torch.long)
+
+        # --- Teacher Input Processing (Unprefixed) ---
+        # This assumes teacher_tokenizer is NLLB tokenizer, needing src_lang
+        # We store the text and codes; actual tokenization can happen in collator or trainer for teacher
+        item["teacher_input_text"] = teacher_input_text
+        item["teacher_src_nllb_code"] = teacher_src_nllb_code
+        # item["teacher_tgt_nllb_code"] = example["teacher_tgt_nllb"] # also pass if needed for teacher labels
+
+        return item
