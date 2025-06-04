@@ -1,0 +1,80 @@
+import csv
+import re
+import logging
+
+import pandas as pd
+from datasets import Dataset
+from io import StringIO
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+class DataCleaning:
+
+    _allowed_character = r"A-Za-z\u014A\u014B\s\.\?\!\,\;\:\-–—’\u2026"
+    pattern = rf"[^{_allowed_character}]"
+
+    def __init__(self):
+        self.test = None
+        self.dir_to_load = "/data"
+
+    def load_parallel_dataset(
+            self,
+            parallel_path: str,
+            swa_col: str,
+            other_col: str
+    ) -> Dataset:
+        # TODO: refactor language loading to be dynamic so that any language can be passed
+        parallel_dataframe = pd.read_csv(parallel_path, usecols=[other_col, swa_col])
+        parallel_dataframe.columns = [other_col, swa_col]
+        parallel_dataframe = parallel_dataframe.dropna()
+        parallel_dataset = Dataset.from_pandas(parallel_dataframe)
+        return parallel_dataset
+
+    def load_monolingual_dataset(
+            self,
+            mono_path: str,
+            main_col: str,
+    ) -> Dataset:
+        mono_dataframe = pd.read_csv(mono_path, usecols=[main_col])
+        mono_dataframe.columns = ['text']
+        mono_ds = Dataset.from_pandas(mono_dataframe)
+        return mono_ds
+
+    def preprocess_bible_text(self, file_path: str, language: str) -> bool:
+        cleaned: list[str] = []
+        file_data: str = ""
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as file:
+                file_data = file.read()
+        except FileNotFoundError:
+            print(f"File {file} not found.")
+
+        paragraph_split = re.split(r'\n\s*\n', file_data.strip())
+
+        for paragraph in paragraph_split:
+            no_chapters_nums = re.sub(self.pattern, "", paragraph)
+            no_chapters_nums = re.sub(r"\s+", " ", no_chapters_nums)
+            no_chapters_nums = no_chapters_nums.replace('\n', ' ')
+            no_chapters_nums = no_chapters_nums.strip()
+            if no_chapters_nums:
+                cleaned.append(no_chapters_nums)
+
+        file_name_to_save = file_path.split("/")[-1].split(".")[0]
+
+        with open(f'data/monolingual/luo/processed/{file_name_to_save}.csv', 'w', newline='', encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(['Dholuo'])
+
+            for paragraph in cleaned:
+                writer.writerow([paragraph])
+            print(f'file processed: {file_name_to_save}')
+
+        return True
+
+if __name__ == "__main__":
+    data_cleaning = DataCleaning()
+    data_cleaning.preprocess_bible_text("data/monolingual/luo/collected/txt/3919_dho.txt", "Dholuo")
+
+
+000000000
