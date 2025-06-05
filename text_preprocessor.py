@@ -39,20 +39,20 @@ except ImportError:
             return text.splitlines()
 
 
-
-
 class TextPreprocessor:
-    def __init__(self, src_lang_iso: str = 'en', tgt_lang_iso: str = 'en'):
-        self.src_lang_iso = src_lang_iso
-        self.tgt_lang_iso = tgt_lang_iso
+
+    def __init__(self, src_lang_short_code: str, tgt_lang_short_code: str):
+        self.src_lang_iso = src_lang_short_code
+        self.tgt_lang_iso = tgt_lang_short_code
         logger.info(
-            f"TextPreprocessor initialized for src: {src_lang_iso}, tgt: {tgt_lang_iso}. Using sentencex: {SENTENCEX_AVAILABLE}")
+            f"TextPreprocessor initialized for src: {src_lang_short_code}, tgt: {tgt_lang_short_code}. Using sentencex: {SENTENCEX_AVAILABLE}")
 
     def _remove_boilerplate(self, text: str) -> str:
         lines = text.splitlines()
         keep = []
         boilerplate_patterns = [
             r'^(evaluation only|created with|copyright|©|\(c\))', r'https?://\S+', r'^\s*$',
+            r"A-Za-z\u014A\u014B\s\.\?\!\,\;\:\-–—’\u2026"
             # Add Dholuo/Swahili specific patterns if known, e.g. common website footers
         ]
         combined_boilerplate_regex = re.compile('|'.join(boilerplate_patterns), re.IGNORECASE)
@@ -60,8 +60,9 @@ class TextPreprocessor:
             s = l.strip()
             if combined_boilerplate_regex.search(s): continue
             if 0 < len(s) < 50 and s.isupper() and sum(c.isalpha() for c in s) > 0.7 * len(s):
-                if not (l_idx > 0 and len(lines[l_idx - 1].strip()) > 0 and \
-                        l_idx < len(lines) - 1 and len(lines[l_idx + 1].strip()) > 0):
+                if not (0 < l_idx < len(lines) - 1
+                        and len(lines[l_idx - 1].strip()) > 0
+                        and len(lines[l_idx + 1].strip()) > 0):
                     continue
             keep.append(l)
         return '\n'.join(keep)
